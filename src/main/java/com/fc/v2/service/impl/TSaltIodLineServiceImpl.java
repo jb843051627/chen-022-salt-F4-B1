@@ -1,6 +1,8 @@
 package com.fc.v2.service.impl;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -21,6 +23,10 @@ import com.fc.v2.service.ITSaltIodLineService;
 @Service
 public class TSaltIodLineServiceImpl implements ITSaltIodLineService {
 
+    /** 输入合法区间（毫克每千克）：0..100，evaluate 与 evaluateTop 共用同一口径 */
+    private static final BigDecimal INPUT_MIN = BigDecimal.ZERO;
+    private static final BigDecimal INPUT_MAX = new BigDecimal("100");
+
     /** 优先级降序；并列按 ruleCode 降序（确定性） */
     private static final Comparator<TSaltIodLine> PRIORITY_THEN_CODE_DESC = new Comparator<TSaltIodLine>() {
         @Override
@@ -39,44 +45,77 @@ public class TSaltIodLineServiceImpl implements ITSaltIodLineService {
     @javax.annotation.Resource
     private TSaltIodLineMapper saltIodLineMapper;
 
-    /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）+ 字符串绑定：
-     * JDBC 的 serverTimezone 与本机时区不对称，直接把 java.util.Date 作参数会整体偏移，
-     * 使边界判定在"切换当日"这类用例上随机错档（实测踩到）。
-     */
-    private static String ts(Date d) {
-        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
-    }
-
     @Override
     public TSaltIodLine selectTSaltIodLineById(Long id) {
         return this.saltIodLineMapper.selectById(id);
     }
 
+    /**
+     * 存量兼容口径（定死，两处以上共用，不得各判各的）：
+     * 老系统带过来的行多数没有维护 status / 时段，故 status 为空按"在场"论，仅显式 1 才停用；
+     * 时段为空表示一头不封；eff_end（让位之日）**不含**当日。
+     */
+    private boolean isActiveAt(TSaltIodLine r, Date at) {
+        if (r == null || at == null) {
+            return false;
+        }
+        if (r.getDelFlag() != null && r.getDelFlag().intValue() == 1) {
+            return false;
+        }
+        if (r.getStatus() != null && r.getStatus().intValue() == 1) {
+            return false;
+        }
+        if (r.getEffStart() != null && r.getEffStart().compareTo(at) > 0) {
+            return false;
+        }
+        if (r.getEffEnd() != null && !at.before(r.getEffEnd())) {
+            return false;
+        }
+        return true;
+    }
+
+    /** 输入越界口径：evaluate 与 evaluateTop 必须一致 */
+    private boolean isInputInRange(BigDecimal input) {
+        return input != null
+                && input.compareTo(INPUT_MIN) >= 0
+                && input.compareTo(INPUT_MAX) <= 0;
+    }
+
     @Override
     public List<TSaltIodLine> listAvailable(Date at) {
         if (at == null) {
-            return new java.util.ArrayList<TSaltIodLine>();
+            return new ArrayList<TSaltIodLine>();
         }
-        return this.saltIodLineMapper.selectList(new QueryWrapper<TSaltIodLine>().eq("del_flag", 0));
+        List<TSaltIodLine> all = this.saltIodLineMapper.selectList(
+                new QueryWrapper<TSaltIodLine>().eq("del_flag", 0));
+        List<TSaltIodLine> avail = new ArrayList<TSaltIodLine>();
+        for (TSaltIodLine r : all) {
+            if (isActiveAt(r, at)) {
+                avail.add(r);
+            }
+        }
+        Collections.sort(avail, PRIORITY_THEN_CODE_DESC);
+        return avail;
     }
 
     @Override
     public int evaluate(String ruleCode, BigDecimal input, Date at) {
-        if (ruleCode == null || ruleCode.trim().isEmpty() || input == null || at == null) {
+        if (ruleCode == null || ruleCode.trim().isEmpty() || at == null) {
+            return 0;
+        }
+        if (!isInputInRange(input)) {
             return 0;
         }
         TSaltIodLine rule = findRule(ruleCode, at);
+        if (rule == null) {
+            return 0;
+        }
         return levelOf(rule, input);
     }
 
     @Override
     public int evaluateTop(BigDecimal input, Date at) {
-        if (input == null || at == null) {
-            return 0;
-        }
-        if (input.compareTo(BigDecimal.ZERO) < 0
-                || input.compareTo(new BigDecimal("100")) > 0) {
+        if (at == null || !isInputInRange(input)) {
             return 0;
         }
         List<TSaltIodLine> avail = listAvailable(at);
@@ -92,7 +131,7 @@ public class TSaltIodLineServiceImpl implements ITSaltIodLineService {
             return false;
         }
         TSaltIodLine r = this.saltIodLineMapper.selectById(id);
-        return r != null;
+        return isActiveAt(r, at);
     }
 
     @Override
@@ -100,49 +139,28 @@ public class TSaltIodLineServiceImpl implements ITSaltIodLineService {
         if (at == null) {
             return 0;
         }
-        return this.saltIodLineMapper
-                .selectList(new QueryWrapper<TSaltIodLine>().eq("del_flag", 0)).size();
+        return listAvailable(at).size();
     }
 
+    /** 定版：与列表/可用性同一口径——at 时刻在场、同代号中顺位最先说话的那一版 */
     private TSaltIodLine findRule(String ruleCode, Date at) {
-        List<TSaltIodLine> hit = this.saltIodLineMapper.selectList(new QueryWrapper<TSaltIodLine>()
-                .eq("del_flag", 0).eq("rule_code", ruleCode));
-        TSaltIodLine newest = null;
-        for (TSaltIodLine r : hit) {
-            if (newest == null || r.getEffEnd() == null) {
-                newest = r;
-            } else if (newest.getEffEnd() != null && r.getEffEnd().after(newest.getEffEnd())) {
-                newest = r;
+        for (TSaltIodLine r : listAvailable(at)) {
+            if (ruleCode.equals(r.getRuleCode())) {
+                return r;
             }
         }
-        return newest;
+        return null;
     }
 
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(TSaltIodLine r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
-        }
-        if (tier == 2) {
-            return r.getTh2Max();
-        }
-        return r.getTh3Max();
-    }
-
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(TSaltIodLine r, int tier) {
-        return r.getTh1Max();
-    }
-
-    /** 分档：等于上限取高一档 */
+    /** 分档：等于上限取高一档（严格小于才落本档）；某档阈值未维护则跳过该档 */
     private int levelOf(TSaltIodLine rule, BigDecimal input) {
-        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) <= 0) {
+        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) < 0) {
             return 1;
         }
-        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) <= 0) {
+        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) < 0) {
             return 2;
         }
-        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) <= 0) {
+        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) < 0) {
             return 3;
         }
         return 4;

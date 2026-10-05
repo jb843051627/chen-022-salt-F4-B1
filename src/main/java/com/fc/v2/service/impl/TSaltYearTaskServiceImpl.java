@@ -1,5 +1,6 @@
 package com.fc.v2.service.impl;
 
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 
@@ -19,8 +20,7 @@ import com.fc.v2.service.ITSaltYearTaskService;
 @Service
 public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
 
-    private static final int WIN_FROM = 2;
-    private static final int WIN_TO = 5;
+    /** 条目情形：0待派 1已派出 2分不出 */
     private static final int STATUS_WAIT = 0;
     private static final int STATUS_DONE = 1;
     private static final int STATUS_FAIL = 2;
@@ -34,35 +34,55 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
     }
 
     /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）：JDBC 的 serverTimezone 与本机
-     * 时区不对称，直接把 java.util.Date 作参数会整体偏移，使"恰好到期"这类边界用例错判。
+     * 可处理条目口径（与 runOnce 共用同一筛选，不得一处查全表一处查半表）：
+     * 未删除 + 待派 + 已到止点时刻（due_at <= at，含当日）。存量行 status/del_flag 为空按待派、正常论。
      */
-    private static String ts(Date d) {
-        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
-    }
-
     @Override
     public List<TSaltYearTask> listDue(Date at) {
+        if (at == null) {
+            return new ArrayList<TSaltYearTask>();
+        }
         List<TSaltYearTask> all = this.saltYearTaskMapper.selectList(new QueryWrapper<TSaltYearTask>());
-        List<TSaltYearTask> due = new java.util.ArrayList<TSaltYearTask>();
+        List<TSaltYearTask> due = new ArrayList<TSaltYearTask>();
         for (TSaltYearTask r : all) {
-            if (r.getDueAt() != null && ts(r.getDueAt()).compareTo(ts(at)) < 0) {
+            if (r.getDelFlag() != null && r.getDelFlag().intValue() == 1) {
+                continue;
+            }
+            if (r.getStatus() != null && r.getStatus().intValue() != STATUS_WAIT) {
+                continue;
+            }
+            if (r.getDueAt() != null && !r.getDueAt().after(at)) {
                 due.add(r);
             }
         }
         return due;
     }
 
+    /**
+     * 执行一次：空批次直接返回 0，不报错；逐条处理，单条失败（含数据残缺/落库异常）
+     * 跳过继续，不牵连其余条目。amount（可提前开口日数）为空或为负即判"分不出"，
+     * 不计成功；能派出的置已派出。返回成功派出条数。
+     */
     @Override
     public int runOnce(Date at) {
         List<TSaltYearTask> due = listDue(at);
-        if (due.get(0) == null) {
+        if (due.isEmpty()) {
             return 0;
         }
         int ok = 0;
         for (TSaltYearTask r : due) {
-            if (r.getAmount().signum() >= 0) {
+            try {
+                if (r.getAmount() == null || r.getAmount().signum() < 0) {
+                    r.setStatus(Integer.valueOf(STATUS_FAIL));
+                    this.saltYearTaskMapper.updateById(r);
+                    continue;
+                }
+                r.setStatus(Integer.valueOf(STATUS_DONE));
+                this.saltYearTaskMapper.updateById(r);
                 ok++;
+            } catch (RuntimeException ex) {
+                // 单条落库失败：跳过，下一条照派。
+                continue;
             }
         }
         return ok;

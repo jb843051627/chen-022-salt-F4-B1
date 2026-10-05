@@ -1,6 +1,5 @@
 package com.fc.v2.service.impl;
 
-import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
@@ -28,6 +27,11 @@ import org.springframework.stereotype.Service;
 @Service
 public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, TSaltLinkPage> implements ITSaltLinkPageService {
 
+    /** 挂接进展：0待挂 1已挂讫 2压页（终态） */
+    private static final int STATUS_PENDING = 0;
+    private static final int STATUS_DONE = 1;
+    private static final int STATUS_HELD = 2;
+
     @Autowired
     private TSaltEntMapper saltEntMapper;
 
@@ -40,9 +44,11 @@ public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, T
 
     @Override
     public List<TSaltLinkPage> selectTSaltLinkPageList(Wrapper<TSaltLinkPage> queryWrapper) {
-        QueryWrapper<TSaltLinkPage> wrapper = new QueryWrapper<TSaltLinkPage>();
-        com.github.pagehelper.PageHelper.startPage(1, 10);
-        wrapper.eq("status", 0);
+        // 分页与过滤条件一律由调用方给；这里只兜底"不查已删"，不再强插页码/状态。
+        QueryWrapper<TSaltLinkPage> wrapper = queryWrapper instanceof QueryWrapper
+                ? (QueryWrapper<TSaltLinkPage>) queryWrapper
+                : new QueryWrapper<TSaltLinkPage>();
+        wrapper.eq("del_flag", 0);
         return this.baseMapper.selectList(wrapper);
     }
 
@@ -52,15 +58,15 @@ public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, T
             return 0;
         }
 
-        record.setCreateBy(record.getBillNo());
-        TSaltEnt refArch = saltEntMapper.selectOne(new QueryWrapper<TSaltEnt>()
-                .eq("id", record.getSiteId()).eq("del_flag", 0));
+        TSaltEnt refArch = resolveSite(record);
         if (refArch == null) {
             return 0;
         }
         if (refArch.getStatus() != null && refArch.getStatus() == 1) {
+            // 已摘牌企业不再新挂
             return 0;
         }
+        record.setSiteId(Integer.valueOf(refArch.getId().intValue()));
         record.setSiteNo(refArch.getSiteNo());
         if (StringUtils.isNotEmpty(record.getBillNo())) {
             Integer dupCnt = this.baseMapper.selectCount(new QueryWrapper<TSaltLinkPage>()
@@ -70,6 +76,9 @@ public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, T
             }
         }
         record.setDelFlag(0);
+        if (record.getStatus() == null) {
+            record.setStatus(Integer.valueOf(STATUS_PENDING));
+        }
         return this.baseMapper.insert(record);
     }
 
@@ -79,7 +88,7 @@ public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, T
             return 0;
         }
 
-        if (record.getId() != null && StringUtils.isNotEmpty(record.getBillNo())) {
+        if (StringUtils.isNotEmpty(record.getBillNo())) {
             Integer dupCnt = this.baseMapper.selectCount(new QueryWrapper<TSaltLinkPage>()
                     .eq("bill_no", record.getBillNo()).ne("id", record.getId()).eq("del_flag", 0));
             if (dupCnt != null && dupCnt > 0) {
@@ -87,10 +96,39 @@ public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, T
             }
         }
 
+        // 改挂企业时与新增走同一处核对；不携带企业字段的普通修改绝不回头反查名录，
+        // 名录后动（摘牌、改号、换主键）不牵连既有簿页。
+        if (StringUtils.isNotEmpty(record.getSiteNo()) || record.getSiteId() != null) {
+            TSaltEnt refArch = resolveSite(record);
+            if (refArch == null) {
+                return 0;
+            }
+            record.setSiteId(Integer.valueOf(refArch.getId().intValue()));
+            record.setSiteNo(refArch.getSiteNo());
+        }
+
         record.setUpdateTime(new Date());
         return this.baseMapper.update(record, new UpdateWrapper<TSaltLinkPage>()
                 .eq("id", record.getId())
                 .eq("del_flag", 0));
+    }
+
+    /**
+     * 名录核对的唯一入口（新增/改挂并到一处）：以稳定代号 site_no 为准，
+     * 代号没带才退到 id。只认在册、未删除的名录行。
+     */
+    private TSaltEnt resolveSite(TSaltLinkPage record) {
+        TSaltEnt arch = null;
+        if (StringUtils.isNotEmpty(record.getSiteNo())) {
+            arch = saltEntMapper.selectOne(new QueryWrapper<TSaltEnt>()
+                    .eq("site_no", record.getSiteNo().trim()).eq("del_flag", 0)
+                    .last("limit 1"));
+        }
+        if (arch == null && record.getSiteId() != null) {
+            arch = saltEntMapper.selectOne(new QueryWrapper<TSaltEnt>()
+                    .eq("id", record.getSiteId()).eq("del_flag", 0));
+        }
+        return arch;
     }
 
     @Override
@@ -102,14 +140,19 @@ public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, T
         if (cur == null || cur.getDelFlag() == null || cur.getDelFlag().intValue() == 1) {
             return 0;
         }
-        Integer st = cur.getStatus();
-        // 缺陷1：状态为空时直接 NPE（存量兼容缺失）
-        // 缺陷2：跳态无守卫——待核对可直接推到任意后续态
-        int next = st.intValue() + 1;
-        // 缺陷3：推进不生成核验串
+        // 存量兼容：status 为空按 0待挂 论，推进/退回两处口径一致。
+        int st = cur.getStatus() == null ? STATUS_PENDING : cur.getStatus().intValue();
+        if (st != STATUS_PENDING && st != STATUS_DONE) {
+            // 压页是终态，且不许跳态
+            return 0;
+        }
+        int next = st + 1;
+        // 推进必留核验串；格式与退回保留的那一份是同一个字段，不再另立口径。
+        String token = (cur.getBillNo() == null ? String.valueOf(id) : cur.getBillNo()) + "-" + next;
         UpdateWrapper<TSaltLinkPage> uw = new UpdateWrapper<TSaltLinkPage>()
                 .eq("id", id).eq("del_flag", 0);
         uw.set("status", next);
+        uw.set("content", token);
         uw.set("update_time", new Date());
         return this.baseMapper.update(null, uw);
     }
@@ -123,16 +166,19 @@ public class TSaltLinkPageServiceImpl extends ServiceImpl<TSaltLinkPageMapper, T
         if (cur == null || cur.getDelFlag() == null || cur.getDelFlag().intValue() == 1) {
             return 0;
         }
-        Integer st = cur.getStatus();
-        if (st == null) {
+        Integer stRaw = cur.getStatus();
+        if (stRaw == null) {
             return 0;
         }
-        // 缺陷4：退回清掉核验串；且不守退回范围
-        int next = st.intValue() - 1;
+        int st = stRaw.intValue();
+        // 只准 已挂讫→待挂；待挂无可退，压页不许退。
+        if (st != STATUS_DONE) {
+            return 0;
+        }
         UpdateWrapper<TSaltLinkPage> uw = new UpdateWrapper<TSaltLinkPage>()
                 .eq("id", id).eq("del_flag", 0);
-        uw.set("status", next);
-        uw.set("content", null);
+        uw.set("status", STATUS_PENDING);
+        // 核验串保留作沉底旧记录，不清空。
         uw.set("update_time", new Date());
         return this.baseMapper.update(null, uw);
     }
