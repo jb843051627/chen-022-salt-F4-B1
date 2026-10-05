@@ -7,6 +7,10 @@ import com.fc.v2.model.auto.TSaltRecordFlow;
 
 /**
  * 跨省经营备案单 Service接口（state-machine 形状：单据流转，不提供增删改查全套）
+ * <p>
+ * 口径定死：推进/回退一次只挪一档；步次到末档（3 缴回封卷）即已封卷（终态）。
+ * 已封卷为终态：推进、回退、改内容、删除一律拒绝；存量老行 status 与 stage 不同步时，
+ * 任一显示已到末档即按已封卷判。
  *
  * @author fuce
  * @date 2026-09-14

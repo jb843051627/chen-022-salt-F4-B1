@@ -41,28 +41,67 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
         return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
     }
 
+    /**
+     * 该时刻可处理的条目，三个条件同时满足：
+     * <ul>
+     * <li>执行窗口内：at 的墙钟小时落在 [WIN_FROM, WIN_TO)（每日 02:00 含 — 05:00 不含）；</li>
+     * <li>到期：due_at &lt;= at（**含恰好到期**，墙钟字符串比较）；</li>
+     * <li>尚未处理：status = 0 待派。</li>
+     * </ul>
+     * 存量老行取舍：status 缺省按待派、del_flag 缺省按正常（老系统未维护这两列的行照样能被兜住）。
+     */
     @Override
     public List<TSaltYearTask> listDue(Date at) {
-        List<TSaltYearTask> all = this.saltYearTaskMapper.selectList(new QueryWrapper<TSaltYearTask>());
         List<TSaltYearTask> due = new java.util.ArrayList<TSaltYearTask>();
+        if (at == null) {
+            return due;
+        }
+        int hour = Integer.parseInt(new java.text.SimpleDateFormat("HH").format(at));
+        if (hour < WIN_FROM || hour >= WIN_TO) {
+            return due;
+        }
+        String now = ts(at);
+        List<TSaltYearTask> all = this.saltYearTaskMapper.selectList(new QueryWrapper<TSaltYearTask>());
         for (TSaltYearTask r : all) {
-            if (r.getDueAt() != null && ts(r.getDueAt()).compareTo(ts(at)) < 0) {
+            if (r.getDelFlag() != null && r.getDelFlag().intValue() == 1) {
+                continue;
+            }
+            if (r.getStatus() != null && r.getStatus().intValue() != STATUS_WAIT) {
+                continue;
+            }
+            if (r.getDueAt() == null) {
+                continue;
+            }
+            if (ts(r.getDueAt()).compareTo(now) <= 0) {
                 due.add(r);
             }
         }
         return due;
     }
 
+    /**
+     * 执行一次：逐条派出并落库（已派出）；amount 缺失的存量老行本分不出，标记"分不出"后跳过；
+     * 单条异常跳过继续，不拖垮整轮。返回成功条数；无可处理条目返回 0。
+     */
     @Override
     public int runOnce(Date at) {
         List<TSaltYearTask> due = listDue(at);
-        if (due.get(0) == null) {
+        if (due.isEmpty()) {
             return 0;
         }
         int ok = 0;
         for (TSaltYearTask r : due) {
-            if (r.getAmount().signum() >= 0) {
+            try {
+                if (r.getAmount() == null) {
+                    r.setStatus(Integer.valueOf(STATUS_FAIL));
+                    this.saltYearTaskMapper.updateById(r);
+                    continue;
+                }
+                r.setStatus(Integer.valueOf(STATUS_DONE));
+                this.saltYearTaskMapper.updateById(r);
                 ok++;
+            } catch (Exception e) {
+                // 单条失败跳过继续
             }
         }
         return ok;

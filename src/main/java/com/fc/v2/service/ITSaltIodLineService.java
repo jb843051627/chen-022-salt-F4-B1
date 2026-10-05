@@ -8,6 +8,13 @@ import com.fc.v2.model.auto.TSaltIodLine;
 
 /**
  * 碘含量分档判定线 Service接口（rule-eval 形状：规则求值，无增删改）
+ * <p>
+ * 可用口径（全接口唯一定义，定位/列表/计数/求值/旁路复用一律同此）：del_flag 正常 + 在场
+ * + at 落在 [eff_start, eff_end) 内（让位之日不含）。
+ * <p>
+ * 存量老行取舍（老系统带过来的行照此判，定死）：eff_start 缺省视为自古生效；eff_end 缺省视为
+ * 永不让位；status 缺省视为在场；del_flag 缺省视为正常；priority 缺省为 0。
+ * 分档边界：等于上限取高一档；输入有效域 [0,100]，越界一律返回 0。
  *
  * @author fuce
  * @date 2026-09-14
